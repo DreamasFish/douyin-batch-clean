@@ -6,7 +6,7 @@
     return;
   }
   window.__dyCleanTM = true;
-  console.log("[dy-clean] chrome-ext v1.6.1 loaded", location.href);
+  console.log("[dy-clean] chrome-ext v1.6.2 loaded", location.href);
 
   function t(el) {
     return ((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim();
@@ -111,11 +111,53 @@
     ).filter(vis).length;
   }
 
-  function empty() {
+  /** 明确空态文案（不是「还在加载」） */
+  function hasDefiniteEmptyText() {
     var b = t(document.body);
-    if (/该账号还未发布过作品哦|暂无内容|暂无喜欢的视频|暂无收藏的视频|暂无收藏/.test(b)) return true;
-    if (/登录后即可观看/.test(b)) return true;
-    return listCardCount() === 0;
+    return /该账号还未发布过作品哦|暂无内容|暂无喜欢的视频|暂无收藏的视频|暂无收藏的音乐|登录后即可观看/.test(
+      b
+    );
+  }
+
+  /** 是否仍在加载（骨架/加载中提示） */
+  function looksLoading() {
+    if (find("加载中", false) || find("加载失败", false)) return true;
+    if (document.querySelector('[class*="skeleton"],[class*="Skeleton"],[class*="loading"],[class*="Loading"]')) {
+      return true;
+    }
+    return false;
+  }
+
+  function empty() {
+    if (hasDefiniteEmptyText()) return true;
+    // 有卡片就不空；无卡片且无空态文案时不确定 → 由 waitForListReady 判定
+    return listCardCount() === 0 && hasDefiniteEmptyText();
+  }
+
+  /**
+   * 等列表就绪：出卡片，或出现明确空态。
+   * 喜欢页加载慢，避免未加载完就当空跳过。
+   */
+  async function waitForListReady(timeoutMs) {
+    timeoutMs = timeoutMs || 15000;
+    var end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      var cards = listCardCount();
+      if (cards > 0) {
+        // 再等一会让整页卡片渲染完
+        await sleep(400);
+        return { ready: true, empty: false, cards: listCardCount() };
+      }
+      if (hasDefiniteEmptyText()) {
+        return { ready: true, empty: true, cards: 0 };
+      }
+      await sleep(300);
+    }
+    // 超时：再观察一轮，仍无卡片且无空态则视为未就绪（不要当空）
+    await sleep(500);
+    if (listCardCount() > 0) return { ready: true, empty: false, cards: listCardCount() };
+    if (hasDefiniteEmptyText()) return { ready: true, empty: true, cards: 0 };
+    return { ready: false, empty: false, cards: listCardCount(), loading: looksLoading() };
   }
 
   function diagnose(label, sink) {
@@ -159,7 +201,7 @@
     var sh = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
     sh.innerHTML =
       "<style>.c{width:320px;background:rgba(18,20,26,.97);color:#e8eaf0;border:1px solid #2c3140;border-radius:12px;padding:12px;font:12px/1.5 -apple-system,BlinkMacSystemFont,PingFang SC,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.45)}h3{margin:0 0 8px;font-size:13px;color:#fe2c55}label{display:flex;gap:8px;align-items:center;margin:6px 0}button.r{width:100%;margin-top:8px;border:0;border-radius:8px;padding:10px;background:#fe2c55;color:#fff;font-weight:700;cursor:pointer}button.s{width:100%;margin-top:6px;border:1px solid #2c3140;border-radius:8px;padding:8px;background:transparent;color:#e8eaf0;cursor:pointer}.log{margin-top:8px;max-height:180px;overflow:auto;color:#8b93a7;white-space:pre-wrap;font-size:11px}</style>" +
-      '<div class="c"><h3>dy-clean v1.6.1</h3>' +
+      '<div class="c"><h3>dy-clean v1.6.2</h3>' +
       '<label><input type="checkbox" id="live"> live 真删（不勾只统计）</label>' +
       '<label><input type="checkbox" id="likes" checked> 喜欢</label>' +
       '<label><input type="checkbox" id="favs" checked> 收藏</label>' +
@@ -186,8 +228,8 @@
         log("已在批量管理");
         return true;
       }
-      // empty list: no batch needed
-      if (empty()) {
+      // empty list: no batch needed（仅明确空态才跳过）
+      if (hasDefiniteEmptyText() && listCardCount() === 0) {
         log("列表为空，无需批量管理");
         return "empty";
       }
@@ -367,19 +409,35 @@
       }, 5000);
       if (tab) {
         fireClick(tab);
-        await sleep(1800);
+        // 喜欢页加载偏慢，多等一会再判定
+        log("等待「" + tabName + "」列表加载…");
+        await sleep(kind === "likes" ? 2500 : 1800);
       } else {
         log("未找到页签「" + tabName + "」", "warn");
       }
 
-      await waitFor(function () {
-        return find("批量管理") || find("暂无") || find("该账号") || listCardCount() > 0;
-      }, 6000);
-      await sleep(500);
-
-      if (empty()) {
+      var ready = await waitForListReady(kind === "likes" ? 20000 : 12000);
+      log(
+        "列表状态: " +
+          JSON.stringify({ ready: ready.ready, empty: ready.empty, cards: ready.cards })
+      );
+      if (ready.ready && ready.empty) {
         log(kind + " 已空", "ok");
         return { empty: true, selected: 0 };
+      }
+      if (!ready.ready) {
+        // 未就绪：不要当空跳过，多等一次
+        log("列表未就绪（可能加载慢），再等 3s 重试", "warn");
+        await sleep(3000);
+        ready = await waitForListReady(8000);
+        if (ready.ready && ready.empty) {
+          log(kind + " 已空", "ok");
+          return { empty: true, selected: 0 };
+        }
+        if (!ready.ready && ready.cards === 0) {
+          log(kind + " 仍无卡片且无空态，本条跳过本轮，下轮再试", "warn");
+          return { error: "list-not-ready" };
+        }
       }
 
       var entered = await enterBatch();
@@ -395,8 +453,13 @@
       diagnose("after-select-" + kind, log);
 
       if (n === 0) {
-        log(kind + " 已空/未选中", "warn");
-        return { empty: true, selected: 0 };
+        if (hasDefiniteEmptyText() || listCardCount() === 0) {
+          log(kind + " 已空/未选中", "warn");
+          return { empty: true, selected: 0 };
+        }
+        log(kind + " 未选中但列表仍在，重试全选", "warn");
+        n = await selectAll();
+        if (n === 0) return { error: "select-failed" };
       }
       if (!live) {
         log("[safe] 未删除，约 " + (n == null ? "?" : n) + " 条", "warn");
@@ -496,7 +559,7 @@
       log("==== 完成 ====", "ok");
     });
 
-    log("面板已就绪 v1.6.1（取消失败会自动重试）。请先点「诊断当前页面」");
+    log("面板已就绪 v1.6.2（喜欢页慢加载会等待）。请先点「诊断当前页面」");
   }
 
   function whenReady() {
