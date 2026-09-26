@@ -6,7 +6,7 @@
     return;
   }
   window.__dyCleanTM = true;
-  console.log("[dy-clean] chrome-ext v1.6.0 loaded", location.href);
+  console.log("[dy-clean] chrome-ext v1.6.1 loaded", location.href);
 
   function t(el) {
     return ((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim();
@@ -159,7 +159,7 @@
     var sh = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
     sh.innerHTML =
       "<style>.c{width:320px;background:rgba(18,20,26,.97);color:#e8eaf0;border:1px solid #2c3140;border-radius:12px;padding:12px;font:12px/1.5 -apple-system,BlinkMacSystemFont,PingFang SC,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.45)}h3{margin:0 0 8px;font-size:13px;color:#fe2c55}label{display:flex;gap:8px;align-items:center;margin:6px 0}button.r{width:100%;margin-top:8px;border:0;border-radius:8px;padding:10px;background:#fe2c55;color:#fff;font-weight:700;cursor:pointer}button.s{width:100%;margin-top:6px;border:1px solid #2c3140;border-radius:8px;padding:8px;background:transparent;color:#e8eaf0;cursor:pointer}.log{margin-top:8px;max-height:180px;overflow:auto;color:#8b93a7;white-space:pre-wrap;font-size:11px}</style>" +
-      '<div class="c"><h3>dy-clean v1.6</h3>' +
+      '<div class="c"><h3>dy-clean v1.6.1</h3>' +
       '<label><input type="checkbox" id="live"> live 真删（不勾只统计）</label>' +
       '<label><input type="checkbox" id="likes" checked> 喜欢</label>' +
       '<label><input type="checkbox" id="favs" checked> 收藏</label>' +
@@ -293,8 +293,39 @@
       return false;
     }
 
+    /** 点「取消/删除」后立刻确认；按钮还在就再点一次（取消收藏偶发失败） */
+    async function actAndConfirm(kind) {
+      if (!(await act(kind))) return false;
+      await sleep(500);
+      var confirmed = await doConfirm();
+      // 部分场景：确认后操作未生效，按钮仍在 → 再走一遍
+      for (let retry = 0; retry < 3; retry++) {
+        await sleep(800);
+        var stillDialog = !!find("确认取消") || !!find("确认删除");
+        var actionLeft = actionNames(kind).some(function (n) {
+          return !!find(n);
+        });
+        if (stillDialog) {
+          log("弹窗仍在，重试确认");
+          await doConfirm();
+          continue;
+        }
+        if (actionLeft && selCount() != null && selCount() > 0) {
+          log("取消可能未生效，重试点击操作");
+          if (await act(kind)) {
+            await sleep(500);
+            await doConfirm();
+            continue;
+          }
+        }
+        break;
+      }
+      return confirmed || true;
+    }
+
     async function doConfirm() {
       var names = ["确认取消", "确认删除", "确认"];
+      var clicked = false;
       for (var k = 0; k < 15; k++) {
         for (var i = 0; i < names.length; i++) {
           var cs = findAll(names[i]);
@@ -304,12 +335,20 @@
           for (var j = 0; j < cs.length; j++) {
             fireClick(cs[j]);
             log("确认: " + t(cs[j]));
-            return;
+            clicked = true;
+            await sleep(400);
+            // 双保险：若弹窗还在再点一次
+            if (find(names[i])) {
+              fireClick(cs[j]);
+              log("确认补点一次");
+            }
+            return true;
           }
         }
         await sleep(250);
       }
-      log("未识别确认弹窗", "warn");
+      if (!clicked) log("未识别确认弹窗", "warn");
+      return clicked;
     }
 
     async function runKind(kind, live) {
@@ -363,9 +402,8 @@
         log("[safe] 未删除，约 " + (n == null ? "?" : n) + " 条", "warn");
         return { dryRun: true, selected: n };
       }
-      if (!(await act(kind))) return { error: "no-action" };
-      await sleep(600);
-      await doConfirm();
+      // 收藏/喜欢取消偶发失败：actAndConfirm 内含重试
+      if (!(await actAndConfirm(kind))) return { error: "no-action" };
       await sleep(1800);
       return { ok: true, selected: n };
     }
@@ -458,7 +496,7 @@
       log("==== 完成 ====", "ok");
     });
 
-    log("面板已就绪 v1.6（不限轮次直到清空）。请先点「诊断当前页面」");
+    log("面板已就绪 v1.6.1（取消失败会自动重试）。请先点「诊断当前页面」");
   }
 
   function whenReady() {
